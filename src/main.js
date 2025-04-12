@@ -3,14 +3,11 @@ import { initializeApp } from 'firebase/app';
 import { getDatabase, ref, onValue } from 'firebase/database';
 import { readFile, writeFile } from 'node:fs/promises';
 import dotenv from 'dotenv';
-import axios from 'axios';
 
 dotenv.config();
 
 // Initialize Firebase
-const firebaseConfig = {
-    databaseURL: 'https://hacker-news.firebaseio.com'
-};
+const firebaseConfig = { databaseURL: 'https://hacker-news.firebaseio.com' };
 const firebaseApp = initializeApp(firebaseConfig);
 const db = getDatabase(firebaseApp);
 
@@ -18,7 +15,9 @@ const db = getDatabase(firebaseApp);
 const client = new Client({ intents: [] });
 const POSTED_IDS_FILE = 'posted.json';
 let postedIds = new Set();
-let BOT_START_TIME = 0; // Will be set when bot starts
+let BOT_START_TIME = 0;
+let LAST_MAX_ITEM = 0;
+
 
 // Environment variables
 const {
@@ -28,76 +27,142 @@ const {
     NEWS_CHANNEL_ID
 } = process.env;
 
-// Load previously posted IDs
+
+// Add request cache and rate limiting
+const FETCH_RETRIES = 3;
+const RETRY_DELAY = 1000; // 1 second
+const REQUEST_DELAY = 100; // 100ms between requests
+
 async function loadPostedIds() {
     try {
         const data = await readFile(POSTED_IDS_FILE, 'utf8');
         postedIds = new Set(JSON.parse(data));
     } catch (err) {
-        if (err.code === 'ENOENT') {
-            await writeFile(POSTED_IDS_FILE, '[]');
-        } else {
-            console.error('Error loading posted IDs:', err);
-        }
+        if (err.code === 'ENOENT') await writeFile(POSTED_IDS_FILE, '[]');
+        else console.error('Error loading posted IDs:', err);
     }
 }
 
-// Save IDs to avoid duplicates
 async function savePostedIds() {
     await writeFile(POSTED_IDS_FILE, JSON.stringify([...postedIds]));
 }
 
-// Fetch HN item details
-async function fetchItem(id) {
+async function fetchItemWithRetry(id, retries = FETCH_RETRIES) {
     try {
-        const res = await axios.get(`https://hacker-news.firebaseio.com/v0/item/${id}.json`);
-        return res.data;
+        const res = await fetch(`https://hacker-news.firebaseio.com/v0/item/${id}.json`);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+        const data = await res.json();
+        // Validate basic item structure
+        if (!data || typeof data !== 'object' || !data.id) {
+            throw new Error('Invalid item format');
+        }
+        return data;
     } catch (err) {
-        console.error(`Failed to fetch item ${id}:`, err.message);
+        if (retries > 0) {
+            await new Promise(resolve => setTimeout(resolve, RETRY_DELAY));
+            return fetchItemWithRetry(id, retries - 1);
+        }
+        console.error(`Failed to fetch item ${id} after ${FETCH_RETRIES} attempts:`, err.message);
         return null;
     }
 }
 
-// Real-time listener for story lists
-function setupListener(endpoint, channelId, type) {
-    const storiesRef = ref(db, `/v0/${endpoint}`);
+function isValidStory(item) {
+    return item &&
+        item.type === 'story' &&
+        item.title &&
+        item.time &&
+        item.time > BOT_START_TIME;
+}
 
-    onValue(storiesRef, async (snapshot) => {
-        const newIds = new Set(snapshot.val());
-        for (const id of newIds) {
-            if (postedIds.has(id)) continue;
+function isValidJob(item) {
+    return item &&
+        item.type === 'job' &&
+        item.title &&
+        item.time &&
+        item.time > BOT_START_TIME;
+}
 
-            const item = await fetchItem(id);
-            if (!item || item.type !== (type === 'job' ? 'job' : 'story')) continue;
+function determineChannel(item) {
+    if (isValidJob(item)) {
+        return JOB_CHANNEL_ID;
+    }
 
-            // Check if story is newer than bot start time
-            if (item.time < BOT_START_TIME) continue;
+    if (isValidStory(item)) {
+        const lowerTitle = (item.title || '').toLowerCase();
+        if (lowerTitle.startsWith('show hn')) return SHOW_CHANNEL_ID;
+        if (lowerTitle.startsWith('ask hn')) return null;
+        return NEWS_CHANNEL_ID;
+    }
 
-            const channel = await client.channels.fetch(channelId);
-            const hnUrl = `https://news.ycombinator.com/item?id=${id}`;
-            const message = [
-                `**${item.title}**`,
-                item.url || hnUrl,
-                `Posted: ${new Date(item.time * 1000).toUTCString()}`
-            ].join('\n');
+    return null;
+}
 
-            await channel.send(message);
-            postedIds.add(id);
-            await savePostedIds();
+async function processItem(id) {
+    if (postedIds.has(id)) return;
+
+    try {
+        const item = await fetchItemWithRetry(id);
+        if (!item) return;
+
+        // Skip comments and invalid items
+        if (!['story', 'job'].includes(item.type)) {
+            console.log(`Skipping non-story/job item ${id} (type: ${item.type})`);
+            return;
+        }
+
+        const channelId = determineChannel(item);
+        if (!channelId) return;
+
+        const channel = await client.channels.fetch(channelId);
+        const hnUrl = `https://news.ycombinator.com/item?id=${id}`;
+
+        const message = [
+            `**${item.title}**`,
+            item.url || hnUrl,
+            `Posted: ${new Date(item.time * 1000).toUTCString()}`
+        ].join('\n');
+
+        await channel.send(message);
+        postedIds.add(id);
+        await savePostedIds();
+        console.log(`Successfully posted item ${id} to channel ${channelId}`);
+    } catch (err) {
+        console.error(`Error processing item ${id}:`, err);
+    } finally {
+        // Add delay between requests
+        await new Promise(resolve => setTimeout(resolve, REQUEST_DELAY));
+    }
+}
+
+function setupMaxItemListener() {
+    const maxItemRef = ref(db, '/v0/maxitem');
+
+    onValue(maxItemRef, async (snapshot) => {
+        const currentMaxItem = snapshot.val();
+        console.log(`New max item detected: ${currentMaxItem}`);
+
+        if (currentMaxItem > LAST_MAX_ITEM) {
+            // Process items in reverse order (newest first)
+            for (let id = currentMaxItem; id > LAST_MAX_ITEM; id--) {
+                await processItem(id);
+            }
+            LAST_MAX_ITEM = currentMaxItem;
         }
     });
 }
 
-// Start bot
 client.on('ready', async () => {
     console.log(`Logged in as ${client.user.tag}!`);
-    BOT_START_TIME = Math.floor(Date.now() / 1000); // Set current time in seconds
+    BOT_START_TIME = Math.floor(Date.now() / 1000);
     await loadPostedIds();
 
-    // Set up real-time listeners
-    setupListener('showstories', SHOW_CHANNEL_ID, 'show');
-    setupListener('jobstories', JOB_CHANNEL_ID, 'job');
-    setupListener('newstories', NEWS_CHANNEL_ID, 'news');
+    const initialMaxItem = await fetch('https://hacker-news.firebaseio.com/v0/maxitem.json')
+        .then(res => res.json());
+    LAST_MAX_ITEM = initialMaxItem;
+
+    setupMaxItemListener();
 });
 
 client.login(BOT_TOKEN);
