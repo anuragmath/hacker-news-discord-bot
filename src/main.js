@@ -118,10 +118,18 @@ async function processItem(id) {
         const channel = await client.channels.fetch(channelId);
         const hnUrl = `https://news.ycombinator.com/item?id=${id}`;
 
+        // Escape markdown special characters in title
+        const escapedTitle = item.title
+            .replace(/[[\]()]/g, '\\$&')
+            .replace(/_/g, '\\_');
+
+        // Create masked URL
+        const displayUrl = item.url ? encodeURI(item.url) : hnUrl;
+        const titleLink = `**[${escapedTitle}](${displayUrl})**`;
+
         const message = [
-            `**${item.title}**`,
-            item.url || hnUrl,
-            `Posted: ${new Date(item.time * 1000).toUTCString()}`
+             titleLink,
+            `*Posted: ${new Date(item.time * 1000).toUTCString()}*`
         ].join('\n');
 
         await channel.send(message);
